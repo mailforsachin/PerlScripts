@@ -1,0 +1,245 @@
+#############################################################################
+#       PATROL CONFIGURATION EXTRACTOR,JSON CONVERTOR & STOMP UPLOADER      #
+#	AUTHOR: SACHIN TEWARI					            # 
+#	RELEASE DATE: 11th NOVEMBER 2016				    #
+#									    #											
+#############################################################################
+#	Version v 1.0: Initial Release (11/25/2016)                         #
+#					                                    #
+#############################################################################
+
+use strict;
+use Net::Stomp;
+
+################SUBROUTINE FOR APPENDING FILE################################
+
+sub read_file 
+{
+    my ($filename) = @_;
+    open my $in, '<:encoding(UTF-8)', $filename or die "Could not open '$filename' for reading $!";
+    local $/ = undef;
+    my $all = <$in>;
+    close $in;
+    return $all;
+}
+ 
+sub write_file 
+{
+    my ($filename, $content) = @_;
+    open my $out, '>>:encoding(UTF-8)', $filename or die "Could not open '$filename' for writing $!";;
+    print $out $content."\n";
+    close $out;
+    return;
+}
+
+###############SUBROUTINE FOR TRIMMING SPACES######################################
+
+sub  trim { my $s = shift; $s =~ s/^\s+|\s+$//g; return $s };
+
+my @months = qw( Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec );
+my @days = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+my $first_stanza;
+my $second_stanza;
+my $message_body;
+
+(my $sec,my $min,my $hour,my $mday, my $mon,my $year,my $wday,my $yday,my $isdst) = localtime();
+my $InputDirectory='PConfigData'.$mday.$months[$mon].$days[$wday];  #CREATES A NEW FOLDER EVERYDAY
+#print $InputDirectory;
+
+unless (-e $InputDirectory or mkdir $InputDirectory)
+{
+        die "Unable to create directory or Directory already exists";
+        print "Unable to create directory or Directory already exists";
+
+}
+
+my $full_path= "./"."AMM_PP_Hosts.txt";     #HOSTS CONFIGURATION FILE TO READ
+open( my $fh, $full_path ) or die "\nCannot open file $full_path $!\n";
+my @lines = <$fh>;
+chomp( @lines );
+close( $fh );
+
+if (-e "./"."Errors.txt") 
+{
+	unlink "./"."Errors.txt";   #RESETTING ERRORS FILE
+}
+
+#######################################RUN THE PCONFIG COMMAND THROUGH THE AMM_PP_HOSTS FILE AND STORE THE FILE(S)###########################
+
+foreach my $line ( @lines )
+{
+	my ($account_name,$hostname,$ipaddress,$solution1,$solution2,$serverfrom ) = split( ';', $line );
+	my $HostName= "Config_"."_".$account_name."_".$hostname."_".$ipaddress."_".$mday.$months[$mon].".txt";
+	
+	if( -e "./".$InputDirectory."/".$HostName)
+	{
+		unlink "./".$InputDirectory."/".$HostName;
+		system("rm -r "."./".$InputDirectory."/"."*");
+	}
+        	
+	system("pconfig +get -host ".$ipaddress.">"."./".$InputDirectory."/".$HostName." -timeout 8");
+	my $size=-s "./".$InputDirectory."/".$HostName;
+	#print $size."\n";
+	
+	if ($size < 100)	#IF CONFIGURATION FILE IS SMALL, CONSIDER THAT IT IS INVALID & LOG IT TO THE ERRORS LOG
+	{
+	  	 
+		 write_file("./"."Errors.txt","./".$InputDirectory."/".$HostName);
+		 system ("rm "."./".$InputDirectory."/".$HostName);
+	}
+}
+
+######################################PREPARE TO SEND CONFIGURATION TO JSON CONSUMER#############################################
+
+my $config_dir = "./".$InputDirectory;
+opendir( my $dh , $config_dir ) or die "\nCannot read $config_dir\n";
+my @file_list = readdir $dh;
+closedir $dh;
+
+#print @file_list;
+
+foreach my $file ( @file_list )
+{
+   
+   
+   next if ( $file eq '.' || $file eq '..' );
+   
+   my $full_path = $config_dir . '//' . $file ;
+   #print $full_path . "\n" ;
+ 
+   my @name = split('_',$file);  
+   
+   open( my $fh, $full_path ) or die "\nCannot open file $full_path $!\n";
+   my @lines = <$fh>;
+   chomp( @lines );
+   close( $fh );
+   my $counter=0;
+   unlink $name[3].'.json';
+   #open (my $ft,'>>', $name[3].'.json');
+   foreach my $line ( @lines )
+   {
+      	  
+	 if ( $line =~ /\/AS\/EVENTSPRING\/PARAM_SETTINGS\/THRESHOLDS/i || $line =~ /\/AS\/EVENTSPRING\/ALERT\/MSG/i)
+	 {
+	  	$line =~ s/"|'|{|}||,$//g;
+		$line =~ s/\/AS\/EVENTSPRING\/ALERT\/MSG//i;
+	        $line =~ s/\/AS\/EVENTSPRING\/PARAM_SETTINGS//i;
+	  	$line =~ s/^\/|=//g;
+	  	$line =~ s/REPLACE/---/;
+	  	$line =~ s/\*\*/,/g;
+	  	$line =~ s/^\s+|\s+$//g;
+	   
+	  	#print $line."\n";	  
+	  	my ( $hierarchy, $range_list ) = split( '---', $line );
+	  	#print $hierarchy . "  " . $range_list . "\n";
+		#print $hierarchy."\n";	  
+                if ($hierarchy =~ /THRESHOLDS/i )
+                {
+ 
+		          my ( $threshold,$app_class, $inst, $parameter ) = split( '/', $hierarchy );
+          		  my ( $param_active, $range1, $range2, $border ) = split( ',', $range_list );
+
+			  my @range1_split =split(' ',$range1);
+		          my @range2_split =split(' ',$range2);
+		          my @border_split =split(' ',$border);
+
+		          if ($counter==0)
+		          {
+                		  $counter=1;
+		                  $first_stanza="{"."\"esm_name\":"."\"".$name[3]."\","."\"source\":"."\"Patrol\"".","."\"tool\":"."\"Patrol\"".",". "\"ip\":"."\"".$name[4]."\","."\"account\":"."\"".$name[2]."\","."\"config\": [";
+		                  $message_body .=$first_stanza;
+
+          		  }
+
+				  $second_stanza="{"."\"instance_name\":"."\"".trim($inst)."\","."\"range1\":"."\"". $range1_split[1]."-".$range1_split[2]."\","."\"range2\":"."\"". $range2_split[1]."-".$range2_split[2]."\","."\"border\":"."\"". $border_split[1]."-".$border_split[2]."\","."\"parameter_name\":"."\"".trim($parameter)."\","."\"application_class\":"."\"".trim($app_class)."\""."},";
+
+                	  $message_body .=$second_stanza;
+        	}
+
+
+	  	if ($hierarchy =~ /msgTextWARNING/i || $hierarchy =~ /msgTextALARM/i)
+          	{
+	 
+	 	        my ( $app_class, $inst, $parameter, $messagetxt ) = split( '/', $hierarchy );
+		        my ( $esmname, $threshold, $message ) = split( ',', $range_list );
+		        if ($threshold=="35")
+		        {
+				$threshold="Sev5(v2),Sev4(v3)";
+		        }
+			if ($threshold=="40")
+                        {
+                                $threshold="Sev4(v2),Sev4(v3)";
+                        }
+			if ($threshold=="50")
+                        {
+                                $threshold="Sev3(v2),Sev3(v3)";
+                        }
+			if ($threshold=="70")
+                        {
+                                $threshold="Sev2(v2),Sev2(v3)";
+                        }
+			if ($threshold=="75")
+                        {
+                                $threshold="Sev1(v2),Sev1(v3)";
+                        }
+
+	  	        #print $app_class . "  " . $inst . "  " . $parameter . $messagetxt. "\n";
+	  	        #print $esmname . " " .  $threshold . "  " . $message . "\n";
+
+	
+	  		if ($counter==0)	
+	  		{
+		  		$counter=1;
+				$first_stanza="{"."\"esm_name\":"."\"".$name[3]."\","."\"source\":"."\"Patrol\"".","."\"tool\":"."\"Patrol\"".",". "\"ip\":"."\"".$name[4]."\","."\"account\":"."\"".$name[2]."\","."\"config\": [";
+				$message_body .=$first_stanza;
+	  		}
+
+                  		$second_stanza="{"."\"instance_name\":"."\"".trim($inst)."\","."\"msgtxt\":"."\"".trim($messagetxt)."\","."\"esm_profile\":"."\"".trim($esmname)."\","."\"Threshold\":"."\"".$threshold."\","."\"message\":"."\"".trim($message)."\","."\"parameter_name\":"."\"".trim($parameter)."\","."\"application_class\":"."\"".trim($app_class)."\""."},";
+		 		$message_body .=$second_stanza;
+
+		}	
+	}
+
+   }
+			$counter=0;
+                        $message_body .="]}";
+                        $message_body=~s/,(?!.*,)//s;
+                        #print $message_body;
+
+
+			my $stomp = Net::Stomp->new( { hostname =>'165.136.136.x', port => '61613' } );
+		        $stomp->connect( { login => 'admin', passcode => 'password' } );
+       			$stomp->send(
+        		{
+		                 destination => '/queue/findhost', body => $message_body
+		        } );
+		        $stomp->disconnect;
+
+        		my $stomp = Net::Stomp->new( { hostname =>'165.136.136.x', port => '61613' } );
+		        $stomp->connect( { login => 'admin', passcode => 'password' } );
+		        $stomp->send(
+		        {
+                		 destination => '/queue/patrol_test1', body => $message_body
+		        } );
+		        $stomp->disconnect;
+		
+		        my $stomp = Net::Stomp->new( { hostname =>'165.136.136.x', port => '61613' } );
+		        $stomp->connect( { login => 'admin', passcode => 'password' } );
+		        $stomp->send(
+		        {
+                		 destination => '/queue/patrol_test3', body => $message_body
+		        } );
+		        $stomp->disconnect;
+			
+			my $stomp = Net::Stomp->new( { hostname =>'155.16.55.x', port => '61613' } );
+                        $stomp->connect( { login => 'admin', passcode => 'password' } );
+                        $stomp->send(
+                        {
+                                 destination => '/queue/patrol_test', body => $message_body
+                        } );
+                        $stomp->disconnect;
+
+			$message_body ='';
+}
+
+
